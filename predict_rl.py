@@ -230,7 +230,7 @@ def main():
 
     # 3) загрузить модель и предсказать
     clf = xgb.XGBClassifier()
-    clf.load_model(str(Path(args.model_dir) / "xgb.json"))
+    clf.load_model(str(Path(args.model_dir) / "xgb_multiclass.json"))
     proba = clf.predict_proba(X)
 
     # поддержка бинарной и мультикласс — метрики ниже для бинарной
