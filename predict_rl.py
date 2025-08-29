@@ -26,7 +26,7 @@ def run_feats(data_dir: Path, schema: Path, out_csv: Path,
     feats.py должен поддерживать --filelist_csv и --filelist_col (как вы добавляли раньше).
     """
     cmd = [
-        "python", "detect_inj/feats.py",
+        "python", "rl/feats.py",
         "--data_dir", str(data_dir),
         "--out_csv",  str(out_csv),
         "--schema",   str(schema),
