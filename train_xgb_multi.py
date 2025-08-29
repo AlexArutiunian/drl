@@ -35,47 +35,81 @@ def save_confusion_matrix(cm, class_names, out_path, title="Confusion Matrix (te
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
-
-def save_roc_ovr(y_true, prob, class_names, out_path, title="ROC (OVR)"):
-    # y_true: int (0..K-1), prob: [N,K]
+    
+def save_roc_ovr(y_true, prob, class_names, out_path, title=None):
+    """
+    Если K==2 — рисуем бинарную ROC для положительного класса (id=1).
+    Если K>2 — рисуем One-vs-Rest ROC по всем классам + macro-average.
+    """
     K = prob.shape[1]
-    y_bin = label_binarize(y_true, classes=list(range(K)))  # [N,K]
+    if title is None:
+        title = "ROC (binary)" if K == 2 else "ROC (OVR)"
+
+    if K == 2:
+        # бинарный случай
+        y_true = np.asarray(y_true, dtype=int)
+        y_score = prob[:, 1]  # вероятность класса 1
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        auc_val = roc_auc_score(y_true, y_score)
+
+        plt.figure(figsize=(6,5), dpi=150)
+        plt.plot(fpr, tpr, lw=2, label=f"AUC={auc_val:.3f}")
+        plt.plot([0,1],[0,1],"--", lw=1)
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(title or "ROC (binary)")
+        plt.legend(loc="lower right")
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+        return
+
+    # ---- K > 2: OVR ----
+    from sklearn.preprocessing import label_binarize
+    y_true = np.asarray(y_true, dtype=int)
+    y_bin = label_binarize(y_true, classes=list(range(K)))  # (N, K)
+
     fpr, tpr, roc_auc = {}, {}, {}
     valid = []
     for i in range(K):
         yi = y_bin[:, i]
-        # пропускаем класс, если в тесте нет ни одного положительного
+        # нет положительных или отрицательных — ROC не строится
         if yi.sum() == 0 or yi.sum() == len(yi):
             continue
         fi, ti, _ = roc_curve(yi, prob[:, i])
         fpr[i], tpr[i] = fi, ti
+        from sklearn.metrics import auc
         roc_auc[i] = auc(fi, ti)
         valid.append(i)
+
     if not valid:
         return  # нечего рисовать
 
-    # macro average
-    # интерполяция на общую сетку FPR
+    # macro-average
     all_fpr = np.unique(np.concatenate([fpr[i] for i in valid]))
     mean_tpr = np.zeros_like(all_fpr)
     for i in valid:
         mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
     mean_tpr /= len(valid)
-    macro_auc = auc(all_fpr, mean_tpr)
+    from sklearn.metrics import auc as _auc
+    macro_auc = _auc(all_fpr, mean_tpr)
 
     plt.figure(figsize=(6,5), dpi=150)
     for i in valid:
-        plt.plot(fpr[i], tpr[i], lw=1, alpha=0.9, label=f"{class_names[i]} (AUC={roc_auc[i]:.3f})")
+        name = class_names[i] if class_names and i < len(class_names) else f"class_{i}"
+        plt.plot(fpr[i], tpr[i], lw=1, alpha=0.9, label=f"{name} (AUC={roc_auc[i]:.3f})")
     plt.plot(all_fpr, mean_tpr, lw=2.0, label=f"macro-average (AUC={macro_auc:.3f})")
     plt.plot([0,1],[0,1],"--",lw=1)
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title(title)
+    plt.title(title or "ROC (OVR)")
     plt.legend(fontsize=8, loc="lower right", ncol=1, frameon=True)
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close()
+
 
 def save_confidence_buckets_multiclass(prob, y_true, y_pred, out_path, model_name="xgb"):
     """
@@ -299,10 +333,16 @@ def main():
     acc = accuracy_score(yte, pred)
     f1_macro = f1_score(yte, pred, average="macro")
     f1_micro = f1_score(yte, pred, average="micro")
-    try:
-        auc_macro_ovr = roc_auc_score(yte, prob, multi_class="ovr", average="macro")
-    except Exception:
-        auc_macro_ovr = np.nan
+    if prob.shape[1] == 2:
+        # бинарный случай: обычный ROC AUC по вероятности положительного класса (id=1)
+        auc_macro_ovr = roc_auc_score(yte, prob[:, 1])
+    else:
+        # мультикласс: OVR-макро AUC
+        try:
+            auc_macro_ovr = roc_auc_score(yte, prob, multi_class="ovr", average="macro")
+        except Exception:
+            auc_macro_ovr = np.nan
+
 
     print("\nAccuracy:", round(float(acc), 4))
     print("F1-macro:", round(float(f1_macro), 4))
