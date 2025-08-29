@@ -19,17 +19,19 @@ from sklearn.metrics import ConfusionMatrixDisplay
 from sklearn.preprocessing import label_binarize
 
 # ---------------- utils ----------------
-def run_feats(data_dir: Path, schema: Path, out_csv: Path,
+def run_feats(data_dir: Path, schema: Path | None, out_csv: Path,
               filelist_csv: Path, filelist_col: str = "filename"):
-    """Считает фичи только по файлам из filelist_csv через drl/feats.py (должен поддерживать --filelist_csv/--filelist_col)."""
+    """Считает фичи только по файлам из filelist_csv через drl/feats.py.
+       Если schema=None — ключ --schema не передаём (feats.py возьмёт дефолт j0..)."""
     cmd = [
         "python", "drl/feats.py",
         "--data_dir", str(data_dir),
         "--out_csv",  str(out_csv),
-        "--schema",   str(schema),
         "--filelist_csv", str(filelist_csv),
         "--filelist_col", filelist_col,
     ]
+    if schema is not None:
+        cmd += ["--schema", str(schema)]
     print(f"[feats] run: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
@@ -117,7 +119,7 @@ def save_confidence_buckets_multiclass(prob, y_true_zero, y_pred_zero, out_path,
 def main():
     ap = argparse.ArgumentParser(description="Predict on npy (multiclass-ready): feats -> XGB model; predict_csv only; nice logs")
     ap.add_argument("--input", required=True, help="Путь к .npy файлу или директории с .npy")
-    ap.add_argument("--schema", required=True, help="schema_joints.json для feats.py")
+    ap.add_argument("--schema", default=None, help="schema_joints.json для feats.py. Если не указан: возьму из --model_dir/schema_joints.json, иначе feats.py использует дефолт j0..")
     ap.add_argument("--model_dir", required=True, help="Папка с xgb_multiclass.json и features_cols.json (+ label_mapping.json)")
     ap.add_argument("--out_csv", default="preds.csv", help="Куда сохранить предсказания")
     # CSV со списком файлов и (опц.) метками
@@ -130,6 +132,17 @@ def main():
     args = ap.parse_args()
 
     inp = Path(args.input); data_dir = prepare_data_dir(inp)
+    model_dir = Path(args.model_dir)
+
+    # ===== resolve schema
+    schema_path: Path | None = Path(args.schema) if args.schema else None
+    if schema_path is None:
+        cand = model_dir / "schema_joints.json"
+        if cand.exists():
+            schema_path = cand
+            print(f"[schema] Using schema from model_dir: {cand}")
+        else:
+            print("[schema] No --schema and no schema_joints.json in model_dir; feats.py will use default joint names (j0..).")
 
     # ===== read predict_csv
     PRED = pd.read_csv(args.predict_csv, encoding=args.encoding)
@@ -155,7 +168,7 @@ def main():
     feats_csv.parent.mkdir(parents=True, exist_ok=True)
 
     # ===== run feats ONLY for files in predict_csv
-    run_feats(data_dir=data_dir, schema=Path(args.schema), out_csv=feats_csv, filelist_csv=Path(args.predict_csv), filelist_col=args.file_col)
+    run_feats(data_dir=data_dir, schema=schema_path, out_csv=feats_csv, filelist_csv=Path(args.predict_csv), filelist_col=args.file_col)
 
     # ===== load features
     F = pd.read_csv(feats_csv)
@@ -178,7 +191,6 @@ def main():
         raise SystemExit("[err] Нет пересечения между файлами в predict_csv и фичами, посчитанными в data_dir.")
 
     # ===== align columns
-    model_dir = Path(args.model_dir)
     cols_needed = json.load(open(model_dir / "features_cols.json"))
     X_df = pd.DataFrame({c: (F[c] if c in F.columns else 0.0) for c in cols_needed}, dtype=np.float32)
     X = X_df.to_numpy(dtype=np.float32)
@@ -238,23 +250,21 @@ def main():
 
     if label_col and label_col in PRED.columns:
         Y = PRED[[label_col, "_key_stem"]].copy()
-        # raw labels as ints
         Y["label_raw"] = pd.to_numeric(Y[label_col], errors="coerce")
         Y = Y.dropna(subset=["label_raw"])
         Y["label_raw"] = Y["label_raw"].astype(int)
-        # map raw -> zero using training mapping
+
         y_true_merge = out.merge(Y[["_key_stem", "label_raw"]], on="_key_stem", how="inner")
         if y_true_merge.empty:
             print("[warn] Метки не сопоставились с предсказаниями — метрики пропущены.")
             return
+
         if label_map_path.exists():
             y_true_zero = y_true_merge["label_raw"].map(raw_to_zero).astype("int32")
         else:
-            # fallback: если raw уже 0..K-1
             if y_true_merge["label_raw"].min() == 0 and y_true_merge["label_raw"].max() == proba.shape[1]-1:
                 y_true_zero = y_true_merge["label_raw"].astype("int32")
             else:
-                # если raw = 1..K → приведём к 0..K-1
                 y_true_zero = (y_true_merge["label_raw"].astype(int) - 1).clip(lower=0).astype("int32")
 
         y_pred_zero_eval = y_true_merge["y_pred_zero"].astype("int32").to_numpy()
@@ -277,7 +287,6 @@ def main():
         cm = confusion_matrix(y_true_zero_eval, y_pred_zero_eval)
         print("Confusion matrix (rows=true, cols=pred):\n", cm)
 
-        # class names = raw labels ordered by zero id
         K = proba.shape[1]
         class_names = [str(zero_to_raw.get(i, i)) for i in range(K)]
         print("\nReport:\n", classification_report(y_true_zero_eval, y_pred_zero_eval, target_names=class_names, digits=3))
