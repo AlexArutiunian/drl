@@ -228,7 +228,7 @@ def main():
     feature_names = list(X_all.columns)
     X_all = X_all.to_numpy(dtype=np.float32)
 
-    # ===== 5) Групповой стратифицированный split, без утечки кусков одного файла
+    # ===== 5) Групповой сплит с учётом test_size и без утечки между кусками одного файла
     y_all = DF["_y"].to_numpy()
     X_all = DF.select_dtypes(include=[np.number]).drop(columns=["label","_y"], errors="ignore")
     feature_names = list(X_all.columns)
@@ -236,7 +236,7 @@ def main():
     groups_all = DF["origin"].values
     idx_all = np.arange(len(y_all))
 
-    # редкие классы (<2 объектов) полностью в train
+    # 5.0) редкие классы (<2 объектов) целиком в train
     counts = pd.Series(y_all).value_counts().sort_index()
     rare_classes = counts[counts < 2].index.tolist()
     mask_rare = np.isin(y_all, rare_classes)
@@ -249,38 +249,84 @@ def main():
     X_rest, y_rest = X_all[idx_rest], y_all[idx_rest]
     groups_rest = groups_all[idx_rest]
 
-    if HAS_SGKF:
-        n_splits = max(2, min(10, int(round(1.0/args.test_size)) if 0.05 <= args.test_size <= 0.5 else 5))
-        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=args.seed)
-        tr_r, te_r = next(sgkf.split(X_rest, y_rest, groups_rest))
-    else:
-        print("[warn] StratifiedGroupKFold недоступен — GroupShuffleSplit (без строгой стратификации).")
+    # 5.1) пытаемся сделать SGKF, когда test_size в разумных пределах и это вообще возможно
+    def try_sgkf_split(X, y, groups, test_size, seed):
+        if not HAS_SGKF:
+            return None
+        # приблизим долю теста как 1/n_splits
+        n_splits = int(round(1.0 / float(test_size)))
+        n_splits = max(2, min(50, n_splits))  # позволим до 50 фолдов
+        # быстрые sanity-checks: нужно хотя бы n_splits разных групп и непустые классы
+        if pd.Series(groups).nunique() < n_splits:
+            return None
+        if pd.Series(y).nunique() < 2:
+            return None
+
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        # берём «первую» фолду — её доля будет близка к 1/n_splits
+        for tr_idx, te_idx in sgkf.split(X, y, groups):
+            return tr_idx, te_idx
+        return None
+
+    tr_r = te_r = None
+    used_sgkf = False
+    if 0.05 <= args.test_size <= 0.5:
+        out = try_sgkf_split(X_rest, y_rest, groups_rest, args.test_size, args.seed)
+        if out is not None:
+            tr_r, te_r = out
+            used_sgkf = True
+
+    # 5.2) если SGKF не подошёл — точная доля теста через GroupShuffleSplit
+    if tr_r is None or te_r is None:
+        from sklearn.model_selection import GroupShuffleSplit
         gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=args.seed)
         tr_r, te_r = next(gss.split(X_rest, y_rest, groups_rest))
+        used_sgkf = False
 
-    # глобальные индексы
+    # 5.3) переводим локальные индексы rest -> глобальные индексы в DF
     g_tr = idx_rest[tr_r]
     g_te = idx_rest[te_r]
 
-    # редкие классы — только в train
+    # 5.4) редкие классы целиком в train
     if len(idx_rare):
         g_tr = np.concatenate([g_tr, idx_rare])
 
-    # проверка отсутствия пересечения групп
+    # 5.5) страховка: пересечений групп быть не должно
     inter = set(DF.iloc[g_tr]["origin"]) & set(DF.iloc[g_te]["origin"])
     if inter:
         raise SystemExit(f"[err] Найдены пересечения групп между train/test: {sorted(list(inter))[:5]} ...")
 
-    # в тесте не должно быть классов, отсутствующих в train
-    if not set(np.unique(y_all[g_te])).issubset(set(np.unique(y_all[g_tr]))):
-        keep_mask = np.isin(y_all[g_te], np.unique(y_all[g_tr]))
+    # 5.6) в тесте не оставляем классы, которых нет в train
+    train_classes = np.unique(y_all[g_tr])
+    keep_mask = np.isin(y_all[g_te], train_classes)
+    g_te = g_te[keep_mask]
+
+    # 5.7) если тест вдруг опустел (может случиться при очень маленьком test_size и сильной фильтрации) — сделаем более щадящий GSS
+    if len(g_te) == 0:
+        from sklearn.model_selection import GroupShuffleSplit
+        fallback_ts = max(args.test_size, 0.05)  # минимум 5%, чтобы что-то осталось
+        gss_fb = GroupShuffleSplit(n_splits=1, test_size=fallback_ts, random_state=args.seed + 1)
+        tr_r, te_r = next(gss_fb.split(X_rest, y_rest, groups_rest))
+        g_tr = idx_rest[tr_r]
+        g_te = idx_rest[te_r]
+        # вернуть редкие классы в train
+        if len(idx_rare):
+            g_tr = np.concatenate([g_tr, idx_rare])
+        # и снова убрать из теста классы, которых нет в train
+        train_classes = np.unique(y_all[g_tr])
+        keep_mask = np.isin(y_all[g_te], train_classes)
         g_te = g_te[keep_mask]
+        if len(g_te) == 0:
+            raise SystemExit("[err] не удалось получить непустой тест даже при fallback. Проверьте распределение классов/групп.")
 
     Xtr, Xte = X_all[g_tr], X_all[g_te]
     ytr, yte = y_all[g_tr], y_all[g_te]
 
-    print(f"[split] train={len(ytr)}  test={len(yte)}  "
-        f"groups_train={DF.iloc[g_tr]['origin'].nunique()}  groups_test={DF.iloc[g_te]['origin'].nunique()}")
+    print(f"[split] method={'SGKF' if used_sgkf else 'GSS'}  "
+        f"test_size_req={args.test_size}  "
+        f"train={len(ytr)}  test={len(yte)}  "
+        f"groups_train={DF.iloc[g_tr]['origin'].nunique()}  "
+        f"groups_test={DF.iloc[g_te]['origin'].nunique()}")
 
     # (опц.) сохраняем списки сплита для контроля
     cols_keep = [c for c in [fname_feat, "basename", "stem"] if c in DF.columns]
@@ -289,15 +335,14 @@ def main():
     pd.concat([train_tbl, test_tbl], axis=0, ignore_index=True).to_csv(os.path.join(args.out_dir, "split_all.csv"), index=False)
     train_tbl.to_csv(os.path.join(args.out_dir, "split_train.csv"), index=False)
     test_tbl.to_csv(os.path.join(args.out_dir, "split_test.csv"), index=False)
-    
-    # ===== 5.1) Кол-во классов берём из train
+
+    # ===== 5.1) Кол-во классов берём из train (как и было)
     classes_in_train = np.unique(ytr)
     num_class = int(classes_in_train.size)
-
-    # убеждаемся, что метки в трейне идут подряд 0..K-1
     assert classes_in_train.min() == 0 and classes_in_train.max() == num_class - 1, \
         f"Train labels must be 0..K-1, got {classes_in_train}"
     print(f"[info] num_class used: {num_class}")
+
 
 
     # ===== 6) XGBoost
