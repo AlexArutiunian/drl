@@ -60,33 +60,70 @@ def save_confusion_matrix(cm, class_names, out_path, title="Confusion Matrix"):
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
-
-def save_roc_ovr(y_true_zero, prob, class_names, out_path, title="ROC (OVR)"):
+def save_roc_ovr(y_true_zero, prob, class_names, out_path, title=None):
+    """
+    Если K==2 — рисуем обычную ROC по положительному классу (id=1).
+    Если K>2 — строим One-vs-Rest кривые + macro-average.
+    """
+    y_true_zero = np.asarray(y_true_zero, dtype=int)
     K = prob.shape[1]
-    y_bin = label_binarize(y_true_zero, classes=list(range(K)))
+    if title is None:
+        title = "ROC (binary)" if K == 2 else "ROC (OVR)"
+
+    # ---------- БИНАРНЫЙ СЛУЧАЙ ----------
+    if K == 2:
+        # Берём вероятность положительного класса (id=1)
+        y_score = prob[:, 1]
+        fpr, tpr, _ = roc_curve(y_true_zero, y_score)
+        auc_val = roc_auc_score(y_true_zero, y_score)
+
+        plt.figure(figsize=(6,5), dpi=150)
+        plt.plot(fpr, tpr, lw=2, label=f"AUC={auc_val:.3f}")
+        plt.plot([0,1],[0,1],"--", lw=1)
+        plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+        plt.title(title); plt.legend(loc="lower right"); plt.grid(alpha=0.3)
+        plt.tight_layout(); plt.savefig(out_path); plt.close()
+        return
+
+    # ---------- МУЛЬТИКЛАСС (OVR) ----------
+    N = y_true_zero.shape[0]
+    # one-hot без label_binarize
+    y_bin = np.zeros((N, K), dtype=int)
+    valid = (y_true_zero >= 0) & (y_true_zero < K)
+    y_bin[np.arange(N)[valid], y_true_zero[valid]] = 1
+
     fpr, tpr, roc_auc = {}, {}, {}
-    valid = []
+    valid_cls = []
     for i in range(K):
         yi = y_bin[:, i]
+        # если нет позитива/негатива — ROC не строится
         if yi.sum() == 0 or yi.sum() == len(yi):
             continue
         fi, ti, _ = roc_curve(yi, prob[:, i])
         fpr[i], tpr[i] = fi, ti
-        roc_auc[i] = roc_auc_score(yi, prob[:, i])
-        valid.append(i)
-    if not valid:
-        return
-    all_fpr = np.unique(np.concatenate([fpr[i] for i in valid]))
+        # per-class AUC
+        from sklearn.metrics import auc as _auc
+        roc_auc[i] = _auc(fi, ti)
+        valid_cls.append(i)
+
+    if not valid_cls:
+        return  # нечего рисовать
+
+    # macro-average кривая
+    all_fpr = np.unique(np.concatenate([fpr[i] for i in valid_cls]))
     mean_tpr = np.zeros_like(all_fpr)
-    for i in valid:
+    for i in valid_cls:
         mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
-    mean_tpr /= len(valid)
-    macro_auc = roc_auc_score(y_bin[:, valid], prob[:, valid], average="macro", multi_class="ovr")
+    mean_tpr /= len(valid_cls)
+    from sklearn.metrics import auc as _auc
+    macro_auc = _auc(all_fpr, mean_tpr)
+
     plt.figure(figsize=(6,5), dpi=150)
-    for i in valid:
-        plt.plot(fpr[i], tpr[i], lw=1, alpha=0.9, label=f"{class_names[i]} (AUC={roc_auc[i]:.3f})")
+    for i in valid_cls:
+        name = class_names[i] if class_names and i < len(class_names) else f"class_{i}"
+        plt.plot(fpr[i], tpr[i], lw=1, alpha=0.9, label=f"{name} (AUC={roc_auc[i]:.3f})")
     plt.plot(all_fpr, mean_tpr, lw=2.0, label=f"macro-average (AUC={macro_auc:.3f})")
-    plt.plot([0,1],[0,1],"--",lw=1)
+    plt.plot([0,1],[0,1],"--", lw=1)
     plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
     plt.title(title); plt.legend(fontsize=8, loc="lower right"); plt.grid(alpha=0.3)
     plt.tight_layout(); plt.savefig(out_path); plt.close()
@@ -274,10 +311,17 @@ def main():
         acc = accuracy_score(y_true_zero_eval, y_pred_zero_eval)
         f1_macro = f1_score(y_true_zero_eval, y_pred_zero_eval, average="macro")
         f1_micro = f1_score(y_true_zero_eval, y_pred_zero_eval, average="micro")
+        K = prob_eval.shape[1]
         try:
-            auc_macro_ovr = roc_auc_score(y_true_zero_eval, prob_eval, multi_class="ovr", average="macro")
+            if K == 2:
+                # бинарная ROC AUC по вероятности класса 1
+                auc_macro_ovr = roc_auc_score(y_true_zero_eval, prob_eval[:, 1])
+            else:
+                # мультикласс OVR macro
+                auc_macro_ovr = roc_auc_score(y_true_zero_eval, prob_eval, multi_class="ovr", average="macro")
         except Exception:
             auc_macro_ovr = np.nan
+
 
         print("\n[metrics-mc]")
         print("Accuracy:", round(float(acc), 4))
