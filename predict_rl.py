@@ -16,7 +16,6 @@ from sklearn.metrics import (
     accuracy_score, roc_auc_score, roc_curve
 )
 from sklearn.metrics import ConfusionMatrixDisplay
-from sklearn.preprocessing import label_binarize
 
 # ---------------- utils ----------------
 def run_feats(data_dir: Path, schema: Path | None, out_csv: Path,
@@ -60,6 +59,7 @@ def save_confusion_matrix(cm, class_names, out_path, title="Confusion Matrix"):
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
+
 def save_roc_ovr(y_true_zero, prob, class_names, out_path, title=None):
     """
     Если K==2 — рисуем обычную ROC по положительному классу (id=1).
@@ -87,10 +87,10 @@ def save_roc_ovr(y_true_zero, prob, class_names, out_path, title=None):
 
     # ---------- МУЛЬТИКЛАСС (OVR) ----------
     N = y_true_zero.shape[0]
-    # one-hot без label_binarize
+    # one-hot вручную (без label_binarize)
     y_bin = np.zeros((N, K), dtype=int)
-    valid = (y_true_zero >= 0) & (y_true_zero < K)
-    y_bin[np.arange(N)[valid], y_true_zero[valid]] = 1
+    valid_mask = (y_true_zero >= 0) & (y_true_zero < K)
+    y_bin[np.arange(N)[valid_mask], y_true_zero[valid_mask]] = 1
 
     fpr, tpr, roc_auc = {}, {}, {}
     valid_cls = []
@@ -101,7 +101,6 @@ def save_roc_ovr(y_true_zero, prob, class_names, out_path, title=None):
             continue
         fi, ti, _ = roc_curve(yi, prob[:, i])
         fpr[i], tpr[i] = fi, ti
-        # per-class AUC
         from sklearn.metrics import auc as _auc
         roc_auc[i] = _auc(fi, ti)
         valid_cls.append(i)
@@ -269,6 +268,9 @@ def main():
         "y_pred": [zero_to_raw.get(int(z), int(z)) for z in y_pred_zero],
         "y_pred_topprob": y_pred_topprob.astype(float)
     })
+    # стабильный id для выравнивания proba после merge
+    out["_row_id"] = np.arange(len(out), dtype=int)
+
     # per-class probabilities with raw labels in column names
     for j in range(proba.shape[1]):
         raw_lbl = zero_to_raw.get(int(j), int(j))
@@ -291,55 +293,91 @@ def main():
         Y = Y.dropna(subset=["label_raw"])
         Y["label_raw"] = Y["label_raw"].astype(int)
 
+        # merge предсказаний с метками
         y_true_merge = out.merge(Y[["_key_stem", "label_raw"]], on="_key_stem", how="inner")
         if y_true_merge.empty:
             print("[warn] Метки не сопоставились с предсказаниями — метрики пропущены.")
             return
 
+        K = proba.shape[1]
+        rows = y_true_merge["_row_id"].to_numpy() if "_row_id" in y_true_merge.columns else None
+
+        # устойчивый мэппинг в zero-based и фильтрация невалидных
         if label_map_path.exists():
-            y_true_zero = y_true_merge["label_raw"].map(raw_to_zero).astype("int32")
+            y_true_zero_map = y_true_merge["label_raw"].map(raw_to_zero)
+            unknown_mask = y_true_zero_map.isna()
+            if unknown_mask.any():
+                bad_vals = sorted(y_true_merge.loc[unknown_mask, "label_raw"].unique().tolist())
+                print(f"[warn] labels not found in model mapping; excluded from metrics: {bad_vals}")
+                y_true_merge = y_true_merge.loc[~unknown_mask].copy()
+                y_true_zero_map = y_true_merge["label_raw"].map(raw_to_zero)
+                rows = y_true_merge["_row_id"].to_numpy() if "_row_id" in y_true_merge.columns else None
+            if y_true_merge.empty:
+                print("[warn] No rows left for metrics after filtering unknown labels. Skipping metrics.")
+                return
+            y_true_zero_eval = y_true_zero_map.astype("int32").to_numpy()
         else:
-            if y_true_merge["label_raw"].min() == 0 and y_true_merge["label_raw"].max() == proba.shape[1]-1:
-                y_true_zero = y_true_merge["label_raw"].astype("int32")
+            y_tmp = y_true_merge["label_raw"].astype(int)
+            # если уже 0..K-1 — оставляем; иначе пробуем 1..K -> 0..K-1
+            if y_tmp.min() == 0 and y_tmp.max() == K - 1:
+                y_zero_tmp = y_tmp
             else:
-                y_true_zero = (y_true_merge["label_raw"].astype(int) - 1).clip(lower=0).astype("int32")
+                y_zero_tmp = y_tmp - 1
+            keep = (y_zero_tmp >= 0) & (y_zero_tmp < K)
+            if (~keep).any():
+                bad_vals = sorted(y_true_merge.loc[~keep, "label_raw"].unique().tolist())
+                print(f"[warn] labels out of range for this model; excluded from metrics: {bad_vals}")
+                y_true_merge = y_true_merge.loc[keep].copy()
+                y_zero_tmp = y_zero_tmp.loc[keep]
+                rows = y_true_merge["_row_id"].to_numpy() if "_row_id" in y_true_merge.columns else None
+            if y_true_merge.empty:
+                print("[warn] No rows left for metrics after filtering out-of-range labels. Skipping metrics.")
+                return
+            y_true_zero_eval = y_zero_tmp.astype("int32").to_numpy()
 
+        # Выравниваем предсказания и вероятности под отфильтрованные строки
         y_pred_zero_eval = y_true_merge["y_pred_zero"].astype("int32").to_numpy()
-        y_true_zero_eval = y_true_zero.to_numpy()
-        prob_eval = proba[y_true_merge.index.values, :]
+        if rows is None:
+            rows = y_true_merge.index.to_numpy()
+        prob_eval = proba[rows, :]
 
+        # Метрики
         acc = accuracy_score(y_true_zero_eval, y_pred_zero_eval)
         f1_macro = f1_score(y_true_zero_eval, y_pred_zero_eval, average="macro")
         f1_micro = f1_score(y_true_zero_eval, y_pred_zero_eval, average="micro")
-        K = prob_eval.shape[1]
         try:
             if K == 2:
-                # бинарная ROC AUC по вероятности класса 1
                 auc_macro_ovr = roc_auc_score(y_true_zero_eval, prob_eval[:, 1])
             else:
-                # мультикласс OVR macro
                 auc_macro_ovr = roc_auc_score(y_true_zero_eval, prob_eval, multi_class="ovr", average="macro")
         except Exception:
             auc_macro_ovr = np.nan
-
 
         print("\n[metrics-mc]")
         print("Accuracy:", round(float(acc), 4))
         print("F1-macro:", round(float(f1_macro), 4))
         print("F1-micro:", round(float(f1_micro), 4))
         print("Macro AUC (OVR):", "nan" if np.isnan(auc_macro_ovr) else round(float(auc_macro_ovr), 4))
-        cm = confusion_matrix(y_true_zero_eval, y_pred_zero_eval)
+
+        # Confusion matrix и отчёт — только по реально встречающимся классам
+        labels_present = sorted(np.unique(y_true_zero_eval).tolist())
+        cm = confusion_matrix(y_true_zero_eval, y_pred_zero_eval, labels=labels_present)
         print("Confusion matrix (rows=true, cols=pred):\n", cm)
 
-        K = proba.shape[1]
-        class_names = [str(zero_to_raw.get(i, i)) for i in range(K)]
-        print("\nReport:\n", classification_report(y_true_zero_eval, y_pred_zero_eval, target_names=class_names, digits=3))
+        class_names_full = [str(zero_to_raw.get(i, i)) for i in range(K)]
+        class_names_present = [class_names_full[i] for i in labels_present]
+        print("\nReport:\n", classification_report(
+            y_true_zero_eval, y_pred_zero_eval,
+            labels=labels_present, target_names=class_names_present, digits=3))
 
         out_dir = out_csv.parent if out_csv.parent.as_posix() != "" else Path(".")
         out_dir.mkdir(parents=True, exist_ok=True)
         with open(out_dir / "classification_report.txt", "w", encoding="utf-8") as f:
-            f.write(classification_report(y_true_zero_eval, y_pred_zero_eval, target_names=class_names, digits=4))
-        pd.DataFrame(cm, index=class_names, columns=class_names).to_csv(out_dir / "confusion_matrix.csv", index=True)
+            f.write(classification_report(
+                y_true_zero_eval, y_pred_zero_eval,
+                labels=labels_present, target_names=class_names_present, digits=4))
+        pd.DataFrame(cm, index=class_names_present, columns=class_names_present)\
+          .to_csv(out_dir / "confusion_matrix.csv", index=True)
 
         metrics_payload = {
             "accuracy": float(acc),
@@ -347,14 +385,19 @@ def main():
             "f1_micro": float(f1_micro),
             "auc_macro_ovr": None if np.isnan(auc_macro_ovr) else float(auc_macro_ovr),
             "n_eval": int(len(y_true_zero_eval)),
-            "classes": class_names,
+            "classes": class_names_present,
         }
         with open(out_dir / "metrics_test.json", "w", encoding="utf-8") as f:
             json.dump(metrics_payload, f, ensure_ascii=False, indent=2)
 
-        save_confusion_matrix(cm, class_names, out_dir / "cm.png", title="Confusion Matrix (predict_csv, multiclass)")
-        save_roc_ovr(y_true_zero_eval, prob_eval, class_names, out_dir / "roc_ovr.png", title="ROC OVR (predict_csv)")
-        save_confidence_buckets_multiclass(prob_eval, y_true_zero_eval, y_pred_zero_eval, out_dir / "confidence_buckets.png", model_name="xgb-mc")
+        # Графики
+        save_confusion_matrix(cm, class_names_present, out_dir / "cm.png",
+                              title="Confusion Matrix (predict_csv)")
+        save_roc_ovr(y_true_zero_eval, prob_eval, class_names_full, out_dir / "roc_ovr.png",
+                     title="ROC OVR (predict_csv)")
+        save_confidence_buckets_multiclass(prob_eval, y_true_zero_eval, y_pred_zero_eval,
+                                           out_dir / "confidence_buckets.png",
+                                           model_name="xgb-mc")
     else:
         print("[info] В predict_csv нет колонки с метками — метрики не посчитаны.")
 
