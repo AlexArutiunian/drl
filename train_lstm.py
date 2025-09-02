@@ -517,10 +517,9 @@ def main():
     save_history_plots(hist, args.out_dir)
     cm = confusion_matrix(y_test, pred_test)
     save_confusion_matrix(cm, class_names, os.path.join(args.out_dir, "cm_test.png"))
-    try:
-        save_roc_ovr(y_test, prob_test, class_names, os.path.join(args.out_dir, "roc_ovr_test.png"))
-    except Exception:
-        pass
+  
+    save_roc_ovr(y_test, prob_test, class_names, os.path.join(args.out_dir, "roc_ovr_test.png"))
+    
 
     # сохранения
     model.save(os.path.join(args.out_dir, "model.keras"))
