@@ -356,9 +356,9 @@ def build_transformer_model(input_shape, num_class: int,
 
     # маска валидных таймстепов (строка не все нули)
     valid_mask = layers.Lambda(lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
-                               name="valid_mask")(inp)  # (B, T) bool
-    # Keras MHA принимает (B, T) bool как attention_mask
-    attn_mask = valid_mask
+                            name="valid_mask")(inp)  # (B, T), bool
+    attn_mask = layers.Lambda(lambda m: tf.cast(m, tf.bool), name="attn_mask")(valid_mask)  # (B, T)
+
 
     # проекция в d_model + позиционка
     x = layers.Dense(d_model, name="proj")(inp)
