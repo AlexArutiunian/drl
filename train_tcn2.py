@@ -797,7 +797,9 @@ def main():
         y_test    = y_all[idx_test]
         pred_test = prob_test.argmax(axis=1)
 
-        acc = accuracy_score(y_test, pred_test)
+        from sklearn.metrics import accuracy_score as sk_acc
+        acc = sk_acc(y_test, pred_test)
+
         f1_macro = f1_score(y_test, pred_test, average="macro")
         f1_micro = f1_score(y_test, pred_test, average="micro")
         with open(os.path.join(args.out_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
