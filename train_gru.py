@@ -240,50 +240,58 @@ def lazy_tf():
     import tensorflow as tf
     from tensorflow.keras import layers, models
     return tf, layers, models
-
-def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, replicas):
+def make_datasets(paths, labels, max_len, feat_dim, bs, downsample, mean, std, replicas,
+                  shuffle_buf=1024, prefetch_n=2, num_parallel_calls=2, clip_abs=8.0):
     import tensorflow as tf
     AUTOTUNE = tf.data.AUTOTUNE
+    labels = np.asarray(labels)
 
-    def gen(indices):
-        def _g():
-            for i in indices:
-                p = items[i]
-                y = labels[i]
-                arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr)
-                x = x[::max(1, downsample)]
-                if x.shape[0] < 2:
-                    continue
-                if x.shape[0] > max_len:
-                    x = x[:max_len]
-                x = (x - mean) / std
-                yield x, np.int32(y)
-        return _g
+    def _load_one_py(i):
+        i = int(i)
+        p = paths[i]; y = labels[i]
+        arr = np.load(p, allow_pickle=False, mmap_mode="r")   # mmap — не тащим всё в RAM
+        x = sanitize_seq(arr)                                 # (T,F) float32
+        x = x[::max(1, downsample)]
+        if x.shape[0] > max_len: x = x[:max_len]
+        x = (x - mean) / std
+        # защита от вылетов/NaN
+        x = np.clip(x, -clip_abs, clip_abs)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        return x.astype(np.float32), np.int32(y)
 
-    sig = (
-        tf.TensorSpec(shape=(None, feat_dim), dtype=tf.float32),
-        tf.TensorSpec(shape=(), dtype=tf.int32),
-    )
+    def _load_one_tf(i):
+        x, y = tf.py_function(_load_one_py, [i], Tout=(tf.float32, tf.int32))
+        x.set_shape([None, feat_dim]); y.set_shape([])
+        return x, y
 
-    def pad_map(x, y):
+    def _pad_map(x, y):
         T = tf.shape(x)[0]
         pad_t = tf.maximum(0, max_len - T)
-        x = tf.pad(x, [[0, pad_t], [0, 0]])
-        x = x[:max_len]
+        x = tf.pad(x, [[0, pad_t], [0, 0]])[:max_len]
         x.set_shape([max_len, feat_dim])
         return x, y
 
     def make(indices, shuffle=False, drop_remainder=False):
-        ds = tf.data.Dataset.from_generator(gen(indices), output_signature=sig)
+        indices = np.asarray(indices, dtype=np.int32)
+        ds = tf.data.Dataset.from_tensor_slices(indices)
         if shuffle:
-            ds = ds.shuffle(4096, reshuffle_each_iteration=True)
-        ds = ds.map(pad_map, num_parallel_calls=AUTOTUNE)
+            # Шеффлим ЛЁГКИЕ индексы, а не массивы (экономит RAM)
+            ds = ds.shuffle(buffer_size=min(len(indices), shuffle_buf),
+                            reshuffle_each_iteration=True)
+        ds = ds.map(_load_one_tf, num_parallel_calls=num_parallel_calls, deterministic=False)
+        ds = ds.map(_pad_map,     num_parallel_calls=num_parallel_calls, deterministic=False)
         ds = ds.batch(bs, drop_remainder=drop_remainder)
-        ds = ds.prefetch(AUTOTUNE)
+        ds = ds.prefetch(prefetch_n)  # маленький префетч — меньше пика RAM
+
+        # ещё немного экономии и стабильности пайплайна
+        opts = tf.data.Options()
+        opts.experimental_deterministic = False
+        opts.threading.max_intra_op_parallelism = 1
+        ds = ds.with_options(opts)
         return ds
 
     return make
+
 
 def build_gru_model(input_shape, learning_rate=1e-3, mixed_precision=False):
     tf, layers, models = lazy_tf()
@@ -475,6 +483,10 @@ def main():
     # Норм-статы по train
     ensure_dir(args.out_dir)
     mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
+    # Минимум для std, чтобы не делить на ~0
+    std = np.maximum(std, 1e-2).astype(np.float32)
+    print(f"[norm] std: min={std.min():.3e}, p50={np.median(std):.3e}")
+
     np.savez_compressed(os.path.join(args.out_dir, "norm_stats.npz"), mean=mean, std=std, max_len=max_len)
 
     # TF / стратегия
