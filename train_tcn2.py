@@ -29,6 +29,7 @@ from tqdm import tqdm
 import os, json, argparse, math, random, re
 import numpy as np
 import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
 
 import matplotlib
 matplotlib.use("Agg")
