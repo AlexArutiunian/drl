@@ -572,7 +572,7 @@ def main():
         validation_data=dev_ds,
         epochs=args.epochs,
         class_weight=class_weight,
-        callbacks=cb + [tf.keras.callbacks.TerminateOnNaN()],
+        callbacks=cb,
         steps_per_epoch=steps_train,
         validation_steps=steps_dev,
         verbose=1
