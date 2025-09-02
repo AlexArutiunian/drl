@@ -417,8 +417,7 @@ def main():
         feat_dim = int(aa.shape[1])
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
-    # Сплит 70/10/20 (стратифицированный)
-    # ==== ГРУППОВОЙ сплит без утечек по префиксу ====
+    # ==== ГРУППОВОЙ сплит без утечек по origin ====
     import re
     from sklearn.model_selection import GroupShuffleSplit
     try:
@@ -427,22 +426,48 @@ def main():
     except Exception:
         HAS_SGKF = False
 
-    def to_origin(path_or_name: str) -> str:
-        b = os.path.basename(str(path_or_name))
-        st = os.path.splitext(b)[0].lower()
-        # убираем суффиксы чанков: _chunk123 или _123
-        st = re.sub(r"(?:_chunk\d+|_\d+)$", "", st)
+    # 1) достанем origin из CSV, если он есть
+    DF_SRC = pd.read_csv(args.csv)
+    name_col = args.filename_col if args.filename_col in DF_SRC.columns else \
+            next((c for c in DF_SRC.columns if c.lower().strip()==args.filename_col.lower()), None)
+    origin_col = next((c for c in DF_SRC.columns if c.lower()=="origin"), None)
+
+    # маппинг filename (basename, lower) -> origin (lower)
+    csv_origin_map = {}
+    if name_col is not None and origin_col is not None:
+        for n, o in zip(DF_SRC[name_col], DF_SRC[origin_col]):
+            if pd.isna(n): continue
+            csv_origin_map[os.path.basename(str(n)).lower()] = str(o).lower()
+
+    # fallback: вычислим origin из имени файла, срезая служебные суффиксы
+    ORX = re.compile(r'(?:_chunk\d+|_aug\d+|_\d+)$', re.IGNORECASE)
+    def to_origin_from_name(path_or_name: str) -> str:
+        st = os.path.splitext(os.path.basename(str(path_or_name)))[0].lower()
+        # повторяем срезание, пока есть совпадение
+        while True:
+            new = ORX.sub('', st)
+            if new == st: break
+            st = new
         return st
 
-    groups_all = np.array([to_origin(p) for p in items_x])
+    # итоговый список групп для каждого items_x[i]
+    groups_all = []
+    for p in items_x:
+        key = os.path.basename(p).lower()
+        g = csv_origin_map.get(key)
+        if not g:
+            g = to_origin_from_name(key)
+        groups_all.append(g)
+    groups_all = np.array(groups_all)
+
     y_all = labels_all
     idx_all = np.arange(len(items_x))
 
-    # сначала ~20% в test, затем из train ~12.5% в dev (итого 70/10/20)
+    # 2) сначала ~20% в test, затем из train ~12.5% в dev (итого ≈70/10/20 по объектам)
     if HAS_SGKF:
-        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)   # 1/5 ≈ 20%
+        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)    # ≈20%
         tr_idx, te_idx = next(sgkf.split(idx_all, y_all, groups_all))
-        sgkf2 = StratifiedGroupKFold(n_splits=8, shuffle=True, random_state=123) # 1/8 ≈ 12.5%
+        sgkf2 = StratifiedGroupKFold(n_splits=8, shuffle=True, random_state=123)  # ≈12.5% от train
         tr2_rel, dev_rel = next(sgkf2.split(tr_idx, y_all[tr_idx], groups_all[tr_idx]))
         idx_train = tr_idx[tr2_rel]
         idx_dev   = tr_idx[dev_rel]
@@ -456,13 +481,14 @@ def main():
         idx_dev   = tr_idx[dev_rel]
         idx_test  = te_idx
 
-    # проверки на утечки групп
-    inter_train_test = set(groups_all[idx_train]) & set(groups_all[idx_test])
-    inter_dev_test   = set(groups_all[idx_dev])   & set(groups_all[idx_test])
-    inter_train_dev  = set(groups_all[idx_train]) & set(groups_all[idx_dev])
-    assert not inter_train_test, f"LEAK: общие префиксы между train и test: {sorted(list(inter_train_test))[:5]} ..."
-    assert not inter_dev_test,   f"LEAK: общие префиксы между dev и test: {sorted(list(inter_dev_test))[:5]} ..."
-    assert not inter_train_dev,  f"LEAK: общие префиксы между train и dev: {sorted(list(inter_train_dev))[:5]} ..."
+    # 3) проверки на утечки по origin
+    Gtr = set(groups_all[idx_train]); Gdv = set(groups_all[idx_dev]); Gte = set(groups_all[idx_test])
+    leak_td = Gtr & Gte
+    leak_dd = Gdv & Gte
+    leak_td2 = Gtr & Gdv
+    assert not leak_td,  f"LEAK train↔test по origin: {sorted(list(leak_td))[:5]} ..."
+    assert not leak_dd,  f"LEAK dev↔test по origin: {sorted(list(leak_dd))[:5]} ..."
+    assert not leak_td2, f"LEAK train↔dev по origin: {sorted(list(leak_td2))[:5]} ..."
 
     # в тесте не должно быть классов, которых нет в train
     train_classes = np.unique(y_all[idx_train])
@@ -470,20 +496,20 @@ def main():
     if mask_te_keep.sum() < len(idx_test):
         idx_test = idx_test[mask_te_keep]
 
-    print(f"[split] train={len(idx_train)} dev={len(idx_dev)} test={len(idx_test)} | "
-        f"groups: train={len(set(groups_all[idx_train]))} dev={len(set(groups_all[idx_dev]))} "
-        f"test={len(set(groups_all[idx_test]))}")
+    # 4) отчёт + аудит
+    def _uniq(arr): return len(set(arr))
+    print(f"[split] items: train={len(idx_train)} dev={len(idx_dev)} test={len(idx_test)} | "
+        f"origins: train={_uniq(groups_all[idx_train])} dev={_uniq(groups_all[idx_dev])} test={_uniq(groups_all[idx_test])}")
 
-    # создаём папку и сохраняем аудит сплита
     ensure_dir(args.out_dir)
-    split_df = pd.DataFrame({
+    pd.DataFrame({
         "path":   [items_x[i] for i in np.concatenate([idx_train, idx_dev, idx_test])],
         "origin": [groups_all[i] for i in np.concatenate([idx_train, idx_dev, idx_test])],
-        "label":  [int(y_all[i]) for i in np.concatenate([idx_train, idx_dev, idx_test])],
+        "label":  [int(y_all[i])  for i in np.concatenate([idx_train, idx_dev, idx_test])],
         "split":  (["train"]*len(idx_train) + ["dev"]*len(idx_dev) + ["test"]*len(idx_test))
-    })
-    split_df.to_csv(os.path.join(args.out_dir, "split_groups.csv"), index=False)
+    }).to_csv(os.path.join(args.out_dir, "split_groups.csv"), index=False)
 
+    ### end split
 
     # Норм-статы по train
     mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
