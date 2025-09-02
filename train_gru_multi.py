@@ -418,12 +418,72 @@ def main():
     print(f"max_len={max_len} | feat_dim={feat_dim}")
 
     # Сплит 70/10/20 (стратифицированный)
-    from sklearn.model_selection import train_test_split
-    idx = np.arange(len(items_x))
-    idx_train_full, idx_test = train_test_split(idx, test_size=0.20, random_state=42, stratify=labels_all)
-    idx_train, idx_dev = train_test_split(idx_train_full, test_size=0.125, random_state=42, stratify=labels_all[idx_train_full])
+    # ==== ГРУППОВОЙ сплит без утечек по префиксу ====
+    import re
+    from sklearn.model_selection import GroupShuffleSplit
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+        HAS_SGKF = True
+    except Exception:
+        HAS_SGKF = False
 
+    def to_origin(path_or_name: str) -> str:
+        b = os.path.basename(str(path_or_name))
+        st = os.path.splitext(b)[0].lower()
+        # убираем суффиксы чанков: _chunk123 или _123
+        st = re.sub(r"(?:_chunk\d+|_\d+)$", "", st)
+        return st
+
+    groups_all = np.array([to_origin(p) for p in items_x])
+    y_all = labels_all
+    idx_all = np.arange(len(items_x))
+
+    # сначала ~20% в test, затем из train ~12.5% в dev (итого 70/10/20)
+    if HAS_SGKF:
+        sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)   # 1/5 ≈ 20%
+        tr_idx, te_idx = next(sgkf.split(idx_all, y_all, groups_all))
+        sgkf2 = StratifiedGroupKFold(n_splits=8, shuffle=True, random_state=123) # 1/8 ≈ 12.5%
+        tr2_rel, dev_rel = next(sgkf2.split(tr_idx, y_all[tr_idx], groups_all[tr_idx]))
+        idx_train = tr_idx[tr2_rel]
+        idx_dev   = tr_idx[dev_rel]
+        idx_test  = te_idx
+    else:
+        gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+        tr_idx, te_idx = next(gss.split(idx_all, y_all, groups_all))
+        gss2 = GroupShuffleSplit(n_splits=1, test_size=0.125/0.80, random_state=43)  # ≈10% от всего
+        tr2_idx, dev_rel = next(gss2.split(tr_idx, y_all[tr_idx], groups_all[tr_idx]))
+        idx_train = tr_idx[tr2_idx]
+        idx_dev   = tr_idx[dev_rel]
+        idx_test  = te_idx
+
+    # проверки на утечки групп
+    inter_train_test = set(groups_all[idx_train]) & set(groups_all[idx_test])
+    inter_dev_test   = set(groups_all[idx_dev])   & set(groups_all[idx_test])
+    inter_train_dev  = set(groups_all[idx_train]) & set(groups_all[idx_dev])
+    assert not inter_train_test, f"LEAK: общие префиксы между train и test: {sorted(list(inter_train_test))[:5]} ..."
+    assert not inter_dev_test,   f"LEAK: общие префиксы между dev и test: {sorted(list(inter_dev_test))[:5]} ..."
+    assert not inter_train_dev,  f"LEAK: общие префиксы между train и dev: {sorted(list(inter_train_dev))[:5]} ..."
+
+    # в тесте не должно быть классов, которых нет в train
+    train_classes = np.unique(y_all[idx_train])
+    mask_te_keep = np.isin(y_all[idx_test], train_classes)
+    if mask_te_keep.sum() < len(idx_test):
+        idx_test = idx_test[mask_te_keep]
+
+    print(f"[split] train={len(idx_train)} dev={len(idx_dev)} test={len(idx_test)} | "
+        f"groups: train={len(set(groups_all[idx_train]))} dev={len(set(groups_all[idx_dev]))} "
+        f"test={len(set(groups_all[idx_test]))}")
+
+    # создаём папку и сохраняем аудит сплита
     ensure_dir(args.out_dir)
+    split_df = pd.DataFrame({
+        "path":   [items_x[i] for i in np.concatenate([idx_train, idx_dev, idx_test])],
+        "origin": [groups_all[i] for i in np.concatenate([idx_train, idx_dev, idx_test])],
+        "label":  [int(y_all[i]) for i in np.concatenate([idx_train, idx_dev, idx_test])],
+        "split":  (["train"]*len(idx_train) + ["dev"]*len(idx_dev) + ["test"]*len(idx_test))
+    })
+    split_df.to_csv(os.path.join(args.out_dir, "split_groups.csv"), index=False)
+
 
     # Норм-статы по train
     mean, std = compute_norm_stats([items[i] for i in idx_train], feat_dim, args.downsample, max_len)
