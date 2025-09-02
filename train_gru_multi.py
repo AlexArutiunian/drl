@@ -279,47 +279,47 @@ def lazy_tf():
     from tensorflow.keras import layers, models
     return tf, layers, models
 
-
-def make_datasets(items, labels, max_len, feat_dim, bs, downsample, mean, std, replicas):
+def make_datasets(paths, labels, max_len, feat_dim, bs, downsample, mean, std, replicas):
     import tensorflow as tf
     AUTOTUNE = tf.data.AUTOTUNE
+    labels = np.asarray(labels)
 
-    def gen(indices):
-        def _g():
-            for i in indices:
-                p = items[i]; y = labels[i]
-                arr = np.load(p, allow_pickle=False, mmap_mode="r")
-                x = sanitize_seq(arr)
-                x = x[::max(1, downsample)]
-                if x.shape[0] < 2: continue
-                if x.shape[0] > max_len: x = x[:max_len]
-                x = (x - mean) / std
-                yield x, np.int32(y)
-        return _g
+    def _load_one_py(i):
+        i = int(i)
+        p = paths[i]; y = labels[i]
+        arr = np.load(p, allow_pickle=False, mmap_mode="r")
+        x = sanitize_seq(arr)                         # (T,F)
+        x = x[::max(1, downsample)]
+        if x.shape[0] > max_len: x = x[:max_len]
+        x = (x - mean) / std
+        return x.astype(np.float32), np.int32(y)
 
-    sig = (
-        tf.TensorSpec(shape=(None, feat_dim), dtype=tf.float32),
-        tf.TensorSpec(shape=(), dtype=tf.int32),
-    )
+    def _load_one_tf(i):
+        x, y = tf.py_function(_load_one_py, [i], Tout=(tf.float32, tf.int32))
+        x.set_shape([None, feat_dim]); y.set_shape([])
+        return x, y
 
-    def pad_map(x, y):
+    def _pad_map(x, y):
         T = tf.shape(x)[0]
         pad_t = tf.maximum(0, max_len - T)
-        x = tf.pad(x, [[0, pad_t], [0, 0]])
-        x = x[:max_len]
+        x = tf.pad(x, [[0, pad_t], [0, 0]])[:max_len]
         x.set_shape([max_len, feat_dim])
         return x, y
 
     def make(indices, shuffle=False, drop_remainder=False):
-        ds = tf.data.Dataset.from_generator(gen(indices), output_signature=sig)
+        ds = tf.data.Dataset.from_tensor_slices(indices)
         if shuffle:
-            ds = ds.shuffle(4096, reshuffle_each_iteration=True)
-        ds = ds.map(pad_map, num_parallel_calls=AUTOTUNE)
+            # шеффлим ЛЁГКИЕ индексы, а не массивы:
+            ds = ds.shuffle(buffer_size=min(len(indices), 8192),
+                            reshuffle_each_iteration=True)
+        ds = ds.map(_load_one_tf, num_parallel_calls=AUTOTUNE, deterministic=False)
+        ds = ds.map(_pad_map,     num_parallel_calls=AUTOTUNE, deterministic=False)
         ds = ds.batch(bs, drop_remainder=drop_remainder)
-        ds = ds.prefetch(AUTOTUNE)
+        ds = ds.prefetch(2)  # маленький префетч — меньше RAM
         return ds
 
     return make
+
 
 
 def build_gru_model(input_shape, num_class: int, learning_rate=1e-3, mixed_precision=False):
@@ -564,12 +564,17 @@ def main():
     ]
 
     # Обучение
+    steps_train = math.ceil(len(idx_train) / global_bs)
+    steps_dev   = math.ceil(len(idx_dev)   / global_bs)
+
     hist = model.fit(
         train_ds,
         validation_data=dev_ds,
         epochs=args.epochs,
         class_weight=class_weight,
-        callbacks=cb,
+        callbacks=cb + [tf.keras.callbacks.TerminateOnNaN()],
+        steps_per_epoch=steps_train,
+        validation_steps=steps_dev,
         verbose=1
     )
 
