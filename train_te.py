@@ -355,10 +355,19 @@ def build_transformer_model(input_shape, num_class: int,
     inp = layers.Input(shape=input_shape, name="seq_input")  # (B, T, F)
 
     # маска валидных таймстепов (строка не все нули)
-    valid_mask = layers.Lambda(lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
-                            name="valid_mask")(inp)  # (B, T), bool
-    attn_mask = layers.Lambda(lambda m: tf.cast(m, tf.bool), name="attn_mask")(valid_mask)  # (B, T)
+    valid_mask = layers.Lambda(
+    lambda t: tf.reduce_any(tf.not_equal(t, 0.0), axis=-1),
+    name="valid_mask"
+    )(inp)  # (B, T) bool
 
+    def _make_qk_mask(m):
+        m = tf.cast(m, tf.bool)          # (B, T)
+        q = tf.expand_dims(m, axis=2)    # (B, T, 1)
+        k = tf.expand_dims(m, axis=1)    # (B, 1, T)
+        qk = tf.logical_and(q, k)        # (B, T, T)
+        return tf.expand_dims(qk, 1)     # (B, 1, T, T)
+
+    attn_mask = layers.Lambda(_make_qk_mask, name="attn_mask")(valid_mask)  # (B,1,T,T)
 
     # проекция в d_model + позиционка
     x = layers.Dense(d_model, name="proj")(inp)
@@ -369,8 +378,10 @@ def build_transformer_model(input_shape, num_class: int,
     for i in range(num_layers):
         x_norm = layers.LayerNormalization(epsilon=1e-6, name=f"ln1_{i}")(x)
         attn_out = layers.MultiHeadAttention(
-            num_heads=num_heads, key_dim=d_model // num_heads,
-            dropout=attn_dropout, name=f"mha_{i}",
+            num_heads=num_heads,
+            key_dim=d_model // num_heads,
+            dropout=attn_dropout,
+            name=f"mha_{i}",
         )(x_norm, x_norm, attention_mask=attn_mask)
         x = layers.Add(name=f"res_attn_{i}")([x, layers.Dropout(dropout, name=f"drop_attn_{i}")(attn_out)])
 
