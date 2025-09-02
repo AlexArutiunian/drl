@@ -795,22 +795,23 @@ def main():
         prob_test = model.predict(test_ds, verbose=0).astype(np.float32)
         y_test    = y_all[idx_test]
         pred_test = prob_test.argmax(axis=1)
+      
 
-        from sklearn.metrics import accuracy_score as sk_acc
-        acc = sk_acc(y_test, pred_test)
-
+    
+      
+        f1_micro = skm.f1_score(y_test, pred_test, average="micro")
         acc = skm.accuracy_score(y_test, pred_test)
         f1_macro = skm.f1_score(y_test, pred_test, average="macro")
-        f1_micro = skm.f1_score(y_test, pred_test, average="micro")
-        print(skm.classification_report(y_test, pred_test, digits=3))
+       
+        cm = skm.confusion_matrix(y_test, pred_test)
+
 
         with open(os.path.join(args.out_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
             json.dump({"accuracy": float(acc), "f1_macro": float(f1_macro), "f1_micro": float(f1_micro)}, f, indent=2)
 
         print("\n=== TEST (multiclass) ===")
-        print(classification_report(y_test, pred_test, target_names=class_names, digits=3))
+        print(skm.classification_report(y_test, pred_test, target_names=class_names, digits=3))
 
-        cm = confusion_matrix(y_test, pred_test)
         save_confusion_matrix(cm, class_names, os.path.join(args.out_dir, "cm_test.png"))
         try:
             save_roc_ovr(y_test, prob_test, class_names, os.path.join(args.out_dir, "roc_ovr_test.png"))
