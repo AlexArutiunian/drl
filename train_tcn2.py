@@ -36,10 +36,7 @@ from sklearn.metrics import (
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    classification_report, confusion_matrix,
-    accuracy_score, f1_score, roc_curve, auc
-)
+import sklearn.metrics as skm
 
 # ====================== ПЛОТЫ ======================
 def save_history_plots(history, out_dir):
@@ -802,8 +799,11 @@ def main():
         from sklearn.metrics import accuracy_score as sk_acc
         acc = sk_acc(y_test, pred_test)
 
-        f1_macro = f1_score(y_test, pred_test, average="macro")
-        f1_micro = f1_score(y_test, pred_test, average="micro")
+        acc = skm.accuracy_score(y_test, pred_test)
+        f1_macro = skm.f1_score(y_test, pred_test, average="macro")
+        f1_micro = skm.f1_score(y_test, pred_test, average="micro")
+        print(skm.classification_report(y_test, pred_test, digits=3))
+
         with open(os.path.join(args.out_dir, "metrics_test.json"), "w", encoding="utf-8") as f:
             json.dump({"accuracy": float(acc), "f1_macro": float(f1_macro), "f1_micro": float(f1_micro)}, f, indent=2)
 
